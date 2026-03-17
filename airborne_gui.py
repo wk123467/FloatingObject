@@ -11,19 +11,22 @@ import json
 import os
 import time
 from airborne_detector import AirborneDetector
-
+import math
+# 使用颜色直方图对比检测到的空飘物
 class AirborneDetectionGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("北京北站空飘物智能检测系统")
-        self.root.geometry("1600x900")
-        self.root.minsize(1400, 800)
+        self.root.geometry("1400x800")  # 减小初始高度
+        self.root.minsize(1200, 700)    # 减小最小尺寸
         
         # 设置样式
         self.setup_styles()
         
         # 初始化检测器
         self.detector = AirborneDetector()
+
+        self.detector.use_sky_detection = False   # 关闭天空检测器
         
         # 视频捕获
         self.cap = None
@@ -64,6 +67,11 @@ class AirborneDetectionGUI:
         ]
         self.camera_names = [cam["name"] for cam in self.camera_list]
 
+        # ========== 新增：相机报警状态初始化（必须放在这里）==========
+        self.camera_alert_status = {}  # 存储每个相机的报警状态
+        for cam in self.camera_list:
+            self.camera_alert_status[cam["name"]] = False
+
         # 截图管理
         self.screenshots = []  # 存储截图信息
         self.screenshot_dir = "screenshots"  # 截图保存目录
@@ -89,6 +97,9 @@ class AirborneDetectionGUI:
         # 日志记录
         self.log_messages = []
         
+        # ========== 新增：启动报警指示灯更新 ==========
+        self.update_alert_indicator()
+
         # 创建界面
         self.create_widgets()
         
@@ -97,6 +108,9 @@ class AirborneDetectionGUI:
         
         # 绑定窗口关闭事件
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+        # ========== 新增：启动报警指示灯更新 ==========
+        # 延迟启动，确保所有控件都已创建
+        self.root.after(1000, self.update_alert_indicator)
 
         # 在 __init__ 方法中找到以下部分：
         # 截图管理
@@ -114,8 +128,6 @@ class AirborneDetectionGUI:
 
         # ========== 新增：警报窗口管理 ==========
         self.alert_windows = {}  # 格式: {event_id: window} 存储当前打开的警报窗口
-        self.max_concurrent_alerts = 1  # 最大同时打开的警报窗口数量
-        self.alert_queue = []  # 等待显示的警报队列
 
 
         # ========== 新增：未读警报管理 ==========
@@ -131,7 +143,65 @@ class AirborneDetectionGUI:
         self.roi_points = None  # 存储多边形点
         self.roi_mask = None    # 预计算的掩码
         self.roi_bbox = None    # 区域边界框（用于快速判断）
+
+        # 相似度判断配置
+        self.similarity_threshold = 0.6      # 相似度阈值
+        self.recent_time_threshold = 120     # 只考虑最近2分钟的事件（秒）
+        self.enable_similarity_check = True  # 是否启用相似度检查
+
+        # 在初始化完成后，启动演示模式（可选）
+        # self.root.after(2000, self.demo_map_alert) 
         
+    def update_alert_indicator(self):
+        """更新报警指示灯（简化版本）"""
+        try:
+            # 检查是否有相机处于报警状态
+            has_alert = any(status for status in self.camera_alert_status.values())
+            
+            # 更新地图显示（状态已经在 set_camera_alert_status 中更新）
+            if has_alert:
+                # 获取报警相机列表
+                alert_cameras = [name for name, status in self.camera_alert_status.items() if status]
+                if alert_cameras:
+                    # 在状态栏显示报警信息
+                    self.status_var.set(f"⚠️ 报警中: {', '.join(alert_cameras[:2])}")
+            
+            # 每2秒更新一次（保持闪烁效果）
+            self.root.after(2000, self.update_alert_indicator)
+            
+        except Exception as e:
+            print(f"更新指示灯时出错: {e}")
+            self.root.after(1000, self.update_alert_indicator)
+    
+    def set_camera_alert_status(self, camera_name, is_alerting):
+        """设置相机的报警状态"""
+        try:
+            # 确保 camera_alert_status 属性存在
+            if not hasattr(self, 'camera_alert_status'):
+                self.camera_alert_status = {}
+            
+            # 更新相机状态
+            old_status = self.camera_alert_status.get(camera_name, False)
+            self.camera_alert_status[camera_name] = is_alerting
+            
+            # 如果状态发生变化，更新地图显示
+            if old_status != is_alerting:
+                # 使用紧凑版电路图更新方法
+                self.update_map_camera_status(camera_name, is_alerting)  # 这个方法已经调用了电路图版本
+                
+                # 如果变为报警状态，添加闪烁效果
+                if is_alerting:
+                    self.flash_compact_circuit_camera_marker(camera_name)
+            
+            # 记录日志
+            if is_alerting:
+                self.log_message(f"相机 '{camera_name}' 触发报警", level="warning")
+            else:
+                self.log_message(f"相机 '{camera_name}' 报警已解除", level="info")
+                
+        except Exception as e:
+            print(f"设置相机报警状态时出错: {e}")
+    
     # 修改检测方法，使用缓存的掩码
     def is_in_roi(self, x, y):
         """快速判断点是否在ROI内"""
@@ -341,59 +411,35 @@ class AirborneDetectionGUI:
     
     def create_input_tab(self, notebook):
         """创建输入源选项卡"""
-        tab = ttk.Frame(notebook, padding="15")
+        tab = ttk.Frame(notebook, padding="10")
         notebook.add(tab, text="输入源")
         
-        # 摄像头选择
-        camera_frame = ttk.LabelFrame(tab, text="摄像头选择", padding="10")
-        camera_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        # 摄像头选择 - 减小内边距
+        camera_frame = ttk.LabelFrame(tab, text="摄像头选择", padding="8")
+        camera_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
-        # 摄像头列表
-        self.camera_list = [
-            {
-                "name": "相机1 (网络)",
-                "type": "network",
-                "url": "rtsp://admin:admin123@192.168.1.101:554/Streaming/Channels/1",
-                "index": None
-            },
-            {
-                "name": "相机2 (网络)",
-                "type": "network", 
-                "url": "rtsp://admin:password@192.168.1.102:554/h264/ch1/main/av_stream",
-                "index": None
-            },
-            {
-                "name": "相机3 (网络)",
-                "type": "network",
-                "url": "rtsp://username:pass@192.168.1.103:554/stream1",
-                "index": None
-            },
-            {
-                "name": "相机4 (本地)",
-                "type": "local",
-                "url": None,
-                "index": 0
-            }
-        ]
+        # ========== 修改：清空初始相机列表，用户可以自己添加 ==========
+        self.camera_list = []  # 完全清空，不保留任何相机
+        self.camera_names = []
+        # ========== 修改结束 ==========
         
         # 摄像头选择下拉列表
-        ttk.Label(camera_frame, text="选择摄像头:").grid(row=0, column=0, sticky=tk.W, pady=(0, 5))
+        ttk.Label(camera_frame, text="选择摄像头:").grid(row=0, column=0, sticky=tk.W, pady=(0, 3))
         
-        self.camera_names = [cam["name"] for cam in self.camera_list]
-        self.camera_var = tk.StringVar(value=self.camera_names[0])
+        self.camera_var = tk.StringVar(value="")
         self.camera_combo = ttk.Combobox(camera_frame, textvariable=self.camera_var, 
-                                        values=self.camera_names, state="readonly", width=30)
-        self.camera_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(10, 0), pady=(0, 5))
+                                        values=self.camera_names, state="readonly", width=20)
+        self.camera_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), padx=(5, 0), pady=(0, 3))
         camera_frame.columnconfigure(1, weight=1)
         
         # 摄像头详细信息显示
-        self.camera_info_label = ttk.Label(camera_frame, text="类型: 网络摄像头", foreground="blue")
-        self.camera_info_label.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 10))
+        self.camera_info_label = ttk.Label(camera_frame, text="请添加相机", foreground="gray")
+        self.camera_info_label.grid(row=1, column=0, columnspan=2, sticky=tk.W, pady=(0, 5))
         
-        # 启动摄像头按钮
+        # 启动摄像头按钮（初始禁用）
         self.start_camera_btn = ttk.Button(camera_frame, text="启动摄像头", 
-                                        command=self.start_selected_camera)
-        self.start_camera_btn.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 5))
+                                        command=self.start_selected_camera, state="disabled")
+        self.start_camera_btn.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 3))
         
         # 自定义摄像头配置按钮
         self.custom_camera_btn = ttk.Button(camera_frame, text="自定义摄像头配置", 
@@ -402,71 +448,715 @@ class AirborneDetectionGUI:
         
         # 摄像头状态指示灯
         self.camera_status_label = ttk.Label(camera_frame, text="状态: 未连接", foreground="red")
-        self.camera_status_label.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(5, 0))
+        self.camera_status_label.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(3, 0))
         
         # 绑定选择事件
         self.camera_combo.bind("<<ComboboxSelected>>", self.on_camera_selected)
         
-        # 视频文件选择（保持不变）
-        file_frame = ttk.LabelFrame(tab, text="视频文件", padding="10")
-        file_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        # 视频文件选择
+        file_frame = ttk.LabelFrame(tab, text="视频文件", padding="8")
+        file_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         
         self.file_path_var = tk.StringVar(value="")
         ttk.Entry(file_frame, textvariable=self.file_path_var, state="readonly", 
-                width=25).grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 5))
+                width=20).grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 3))
         file_frame.columnconfigure(0, weight=1)
         
         ttk.Button(file_frame, text="浏览...", 
-                command=self.browse_video_file).grid(row=0, column=1, padx=(5, 0), pady=(0, 5))
+                command=self.browse_video_file).grid(row=0, column=1, padx=(3, 0), pady=(0, 3))
         
         self.video_file_btn = ttk.Button(file_frame, text="打开视频文件", 
                                         command=self.start_video_file)
         self.video_file_btn.grid(row=1, column=0, columnspan=2, sticky=(tk.W, tk.E))
         
-        # 区域设置（保持不变）
-        # 区域设置（修改为使用新编辑器）
-        region_frame = ttk.LabelFrame(tab, text="检测区域设置", padding="10")
-        region_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        # ========== 区域设置 - 改为一行 ==========
+        region_frame = ttk.LabelFrame(tab, text="检测区域设置", padding="8")
+        region_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        # 将控件放在一行
+        control_frame = ttk.Frame(region_frame)
+        control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
         self.enable_roi_var = tk.BooleanVar(value=self.detector.enable_roi)
-        ttk.Checkbutton(region_frame, text="启用区域检测", variable=self.enable_roi_var,
-                    command=self.update_roi_enabled).grid(row=0, column=0, sticky=tk.W, pady=(0, 10))
+        ttk.Checkbutton(control_frame, text="启用区域检测", variable=self.enable_roi_var,
+                    command=self.update_roi_enabled).pack(side=tk.LEFT, padx=(0, 10))
         
-        # 修改为使用新编辑器
-        self.select_region_btn = ttk.Button(region_frame, text="🖱️ 绘制检测区域", 
+        self.select_region_btn = ttk.Button(control_frame, text="🖱️ 绘制检测区域", 
                                         command=self.select_region, width=15)
-        self.select_region_btn.grid(row=1, column=0, sticky=tk.W, pady=(0, 5))
-
-        # === 新增：添加区域信息显示和清除按钮 ===
-        # 区域信息标签
+        self.select_region_btn.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.clear_region_btn = ttk.Button(
+            control_frame, 
+            text="🗑️ 清除区域", 
+            command=self.clear_region,
+            state="disabled",
+            width=12
+        )
+        self.clear_region_btn.pack(side=tk.LEFT)
+        
+        # 区域信息标签放在第二行
         self.region_info_label = ttk.Label(
             region_frame, 
             text="未设置检测区域", 
             foreground="gray",
-            wraplength=250  # 限制宽度，自动换行
+            wraplength=350
         )
-        self.region_info_label.grid(row=2, column=0, sticky=tk.W, pady=(5, 5))
+        self.region_info_label.grid(row=1, column=0, sticky=tk.W, pady=(5, 0))
         
-        # 清除区域按钮
-        self.clear_region_btn = ttk.Button(
-            region_frame, 
-            text="🗑️ 清除区域", 
-            command=self.clear_region,
-            state="disabled"
-        )
-        self.clear_region_btn.grid(row=3, column=0, sticky=tk.W, pady=(0, 5))
+        # ========== 可编辑的并联电路风格电子地图（简化版）==========
+        map_frame = ttk.LabelFrame(tab, text="并联电路 - 相机网络 (可编辑)", padding="5")
+        map_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
         
-        # 天空检测（保持不变）
-        sky_frame = ttk.LabelFrame(tab, text="天空检测", padding="10")
-        sky_frame.grid(row=3, column=0, sticky=(tk.W, tk.E))
+        # 创建Canvas用于绘制地图
+        self.map_canvas = tk.Canvas(map_frame, width=450, height=200, bg="#1a1a1a", 
+                                    highlightthickness=1, highlightbackground="#00ff00")
+        self.map_canvas.grid(row=0, column=0, sticky=(tk.W, tk.E))
         
-        self.enable_sky_detection_var = tk.BooleanVar(value=self.detector.use_sky_detection)
-        ttk.Checkbutton(sky_frame, text="启用天空区域检测", 
-                    variable=self.enable_sky_detection_var,
-                    command=self.update_sky_detection).grid(row=0, column=0, sticky=tk.W)
+        # 地图编辑工具栏
+        edit_toolbar = ttk.Frame(map_frame)
+        edit_toolbar.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(3, 0))
+        
+        # 添加相机按钮
+        self.add_camera_btn = ttk.Button(edit_toolbar, text="➕ 添加相机", 
+                                        command=self.start_add_camera_mode, width=12)
+        self.add_camera_btn.pack(side=tk.LEFT, padx=(0, 5))
+        
+        # 编辑模式标签
+        self.edit_mode_label = ttk.Label(edit_toolbar, text="", foreground="#00ff00")
+        self.edit_mode_label.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # 添加线段按钮
+        self.add_line_btn = ttk.Button(edit_toolbar, text="〰️ 添加线段", 
+                                    command=self.start_add_line_mode, width=12)
+        self.add_line_btn.pack(side=tk.LEFT, padx=(5, 0))
+        
+        # 添加紧凑的图例
+        legend_frame = ttk.Frame(map_frame)
+        legend_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(3, 0))
+        
+        # 正常状态图例
+        normal_legend = tk.Canvas(legend_frame, width=20, height=20, bg="#1a1a1a", highlightthickness=0)
+        normal_legend.create_oval(2, 2, 18, 18, fill="#808080", outline="#404040", width=2)
+        normal_legend.create_text(10, 8, text="📷", fill="#e0e0e0", font=("Arial", 8))
+        normal_legend.grid(row=0, column=0, padx=(0, 2))
+        ttk.Label(legend_frame, text="正常", foreground="#00ff00", background="#1a1a1a", 
+                font=("Microsoft YaHei", 8)).grid(row=0, column=1, padx=(0, 8))
+
+        # 报警状态图例
+        alert_legend = tk.Canvas(legend_frame, width=20, height=20, bg="#1a1a1a", highlightthickness=0)
+        alert_legend.create_oval(2, 2, 18, 18, fill="#ff0000", outline="#990000", width=2)
+        alert_legend.create_text(10, 8, text="📷", fill="white", font=("Arial", 8))
+        alert_legend.grid(row=0, column=2, padx=(0, 2))
+        ttk.Label(legend_frame, text="报警", foreground="#ff0000", background="#1a1a1a", 
+                font=("Microsoft YaHei", 8)).grid(row=0, column=3, padx=(0, 8))
+
+        # 线段图例
+        line_legend = tk.Canvas(legend_frame, width=20, height=20, bg="#1a1a1a", highlightthickness=0)
+        line_legend.create_line(2, 10, 18, 10, fill="#00ff00", width=2)
+        line_legend.grid(row=0, column=4, padx=(0, 2))
+        ttk.Label(legend_frame, text="线段", foreground="#00ff00", background="#1a1a1a", 
+                font=("Microsoft YaHei", 8)).grid(row=0, column=5)
+        
+        # 初始化地图元素列表
+        self.map_lines = []  # 存储自定义线段 [(id, (x1,y1,x2,y2))]
+        self.is_edit_mode = False
+        self.is_line_mode = False
+        self.line_start = None  # 线段起点
+        self.temp_line = None   # 临时线段预览
+        self.temp_camera = None # 临时相机预览
+        
+        # 绘制基础并联电路
+        self.draw_parallel_circuit_background()
+        
+        # 初始化相机标记
+        self.camera_markers = {}
+        self.draw_parallel_circuit_camera_markers()
+        
+        # 绑定鼠标事件
+        self.map_canvas.bind("<Button-1>", self.on_map_click)
+        self.map_canvas.bind("<Motion>", self.on_map_motion)
+        self.map_canvas.bind("<Button-3>", self.on_map_right_click)
         
         # 初始更新摄像头信息
         self.on_camera_selected(None)
+    
+    def draw_parallel_circuit_background(self):
+        """绘制并联电路风格背景（简化版）- 完全清空背景"""
+        # 删除所有背景元素
+        for item in self.map_canvas.find_all():
+            tags = self.map_canvas.gettags(item)
+            # 只删除没有标签或者标签为"background"的元素
+            if not tags or "background" in tags:
+                self.map_canvas.delete(item)
+        
+        # 注意：这里不再绘制任何背景元素，地图完全空白
+        # 用户可以自由添加相机和线段
+        pass  # 空函数，什么都不画
+
+    def draw_parallel_circuit_camera_markers(self):
+        """绘制并联电路风格的相机标记"""
+        # 只清除相机相关的元素
+        for tag in ["camera", "camera_icon", "camera_label"]:
+            for item in self.map_canvas.find_withtag(tag):
+                self.map_canvas.delete(item)
+        
+        self.camera_markers.clear()
+        
+        # 为每个相机绘制标记
+        for camera in self.camera_list:
+            name = camera["name"]
+            x, y = camera["position"]
+            
+            # 检查报警状态
+            is_alert = self.camera_alert_status.get(name, False)
+            
+            # 根据状态选择颜色
+            if is_alert:
+                color = "#ff0000"  # 红色 - 报警
+                outline_color = "#990000"
+                text_color = "white"
+            else:
+                color = "#808080"  # 灰色 - 正常
+                outline_color = "#404040"
+                text_color = "#e0e0e0"
+            
+            # 绘制圆形相机标记
+            marker_id = self.map_canvas.create_oval(
+                x-12, y-12, x+12, y+12,
+                fill=color,
+                outline=outline_color,
+                width=2,
+                tags=("camera", f"camera_{name}")
+            )
+            
+            # 添加相机图标
+            icon_id = self.map_canvas.create_text(
+                x, y-2,
+                text="📷",
+                fill=text_color,
+                font=("Arial", 10),
+                tags=("camera_icon", f"icon_{name}")
+            )
+            
+            # 添加相机名称
+            label_id = self.map_canvas.create_text(
+                x, y+18,
+                text=name,
+                fill=text_color,
+                font=("Courier", 7, "bold"),
+                tags=("camera_label", f"label_{name}")
+            )
+            
+            # 存储标记ID
+            self.camera_markers[name] = {
+                'marker': marker_id,
+                'icon': icon_id,
+                'label': label_id
+            }
+    
+    def start_add_line_mode(self):
+        """开始添加线段模式"""
+        self.is_line_mode = True
+        self.is_edit_mode = False
+        self.edit_mode_label.config(text="点击起点开始绘制线段")
+        self.map_canvas.config(cursor="crosshair")
+        self.add_line_btn.config(text="✖️ 取消线段", command=self.cancel_add_line_mode)
+        self.add_camera_btn.config(state="disabled")
+        self.line_start = None
+        
+        # 清除所有临时标记
+        self.map_canvas.delete("temp_point")
+        self.map_canvas.delete("temp_line")
+        self.map_canvas.delete("temp_camera")
+
+    def cancel_add_line_mode(self):
+        """取消添加线段模式"""
+        self.is_line_mode = False
+        self.edit_mode_label.config(text="")
+        self.map_canvas.config(cursor="")
+        self.add_line_btn.config(text="〰️ 添加线段", command=self.start_add_line_mode)
+        self.add_camera_btn.config(state="normal")
+        
+        # 清除所有临时标记
+        self.map_canvas.delete("temp_point")
+        self.map_canvas.delete("temp_line")
+        self.map_canvas.delete("temp_camera")
+        self.line_start = None
+
+    def on_map_click(self, event):
+        """处理地图点击事件"""
+        if self.is_line_mode:
+            # 线段绘制模式
+            self.handle_line_click(event)
+        elif self.is_edit_mode:
+            # 添加相机模式
+            self.add_new_camera(event.x, event.y)
+            self.cancel_add_camera_mode()
+        else:
+            # 检查是否点击了现有相机（用于编辑位置）
+            self.check_camera_selection(event)
+
+    def handle_line_click(self, event):
+        """处理线段绘制点击"""
+        x, y = event.x, event.y
+        
+        # 限制坐标在Canvas范围内
+        x = max(0, min(x, 450))
+        y = max(0, min(y, 200))
+        
+        if self.line_start is None:
+            # 第一个点：设置起点
+            self.line_start = (x, y)
+            # 清除旧的临时标记
+            self.map_canvas.delete("temp_point")
+            self.map_canvas.delete("temp_line")
+            # 显示起点标记
+            self.map_canvas.create_oval(
+                x-4, y-4, x+4, y+4, 
+                fill="#00ff00", 
+                outline="#00aa00",
+                width=2,
+                tags=("temp_point",)
+            )
+            # 显示提示文字
+            self.edit_mode_label.config(text="点击终点完成线段")
+        else:
+            # 第二个点：绘制线段
+            x1, y1 = self.line_start
+            x2, y2 = x, y
+            
+            # 避免绘制长度为0的线段
+            if abs(x1 - x2) < 5 and abs(y1 - y2) < 5:
+                self.edit_mode_label.config(text="线段太短，请重新选择起点")
+                self.line_start = None
+                self.map_canvas.delete("temp_point")
+                self.map_canvas.delete("temp_line")
+                return
+            
+            # 生成唯一的线段ID
+            line_index = len(self.map_lines)
+            line_tag = f"line_{line_index}"
+            
+            # 创建线段
+            line_id = self.map_canvas.create_line(
+                x1, y1, x2, y2,
+                fill="#00ff00",
+                width=2,
+                tags=("line", line_tag)
+            )
+            
+            # 保存线段信息
+            self.map_lines.append({
+                'id': line_id,
+                'tag': line_tag,
+                'coords': (x1, y1, x2, y2)
+            })
+            
+            # 清除临时标记和预览
+            self.map_canvas.delete("temp_point")
+            self.map_canvas.delete("temp_line")
+            self.line_start = None
+            
+            # 更新提示
+            self.edit_mode_label.config(text="点击起点开始新线段，或点击其他按钮退出")
+            self.log_message(f"已添加线段 {line_index+1}", level="info")
+
+    def on_map_motion(self, event):
+        """鼠标移动事件"""
+        x, y = event.x, event.y
+        
+        # 限制坐标在Canvas范围内
+        x = max(0, min(x, 450))
+        y = max(0, min(y, 200))
+        
+        if self.is_line_mode and self.line_start:
+            # 线段绘制模式 - 显示预览线
+            # 先清除旧的预览线
+            self.map_canvas.delete("temp_line")
+            
+            x1, y1 = self.line_start
+            self.temp_line = self.map_canvas.create_line(
+                x1, y1, x, y,
+                fill="#00ff00",
+                width=2,
+                dash=(4, 4),
+                tags=("temp_line",)
+            )
+        elif self.is_edit_mode:
+            # 添加相机模式 - 显示预览
+            self.map_canvas.delete("temp_camera")
+            
+            # 显示预览圆形
+            self.temp_camera = self.map_canvas.create_oval(
+                x-12, y-12, x+12, y+12,
+                fill="#00ff00",
+                outline="#00aa00",
+                width=2,
+                stipple="gray50",
+                tags=("temp_camera",)
+            )
+            self.map_canvas.create_text(
+                x, y-2, 
+                text="📷", 
+                fill="black", 
+                font=("Arial", 10), 
+                tags=("temp_camera",)
+            )
+            self.map_canvas.create_text(
+                x, y+18, 
+                text="新相机", 
+                fill="#00ff00", 
+                font=("Courier", 7), 
+                tags=("temp_camera",)
+            )
+        elif hasattr(self, 'dragging_camera'):
+            # 拖动相机模式 - 实时更新位置
+            # 先清除所有相机的临时状态
+            for camera in self.camera_list:
+                if camera["name"] == self.dragging_camera:
+                    # 更新位置
+                    camera["position"] = (x, y)
+                    break
+            
+            # 重新绘制所有相机
+            self.draw_parallel_circuit_camera_markers()
+
+    def on_map_right_click(self, event):
+        """右键点击 - 删除元素"""
+        items = self.map_canvas.find_overlapping(event.x-5, event.y-5, event.x+5, event.y+5)
+        for item in items:
+            tags = self.map_canvas.gettags(item)
+            for tag in tags:
+                if tag.startswith("camera_"):
+                    camera_name = tag[7:]
+                    self.delete_camera(camera_name)
+                    return
+                elif tag.startswith("line_"):
+                    self.delete_line(item, tag)
+                    return
+                elif tag == "line":
+                    # 如果是通用line标签，需要找到具体的line_x标签
+                    for t in tags:
+                        if t.startswith("line_"):
+                            self.delete_line(item, t)
+                            return
+
+    def delete_line(self, line_id, line_tag=None):
+        """删除线段"""
+        if messagebox.askyesno("确认", "确定要删除这条线段吗？"):
+            self.map_canvas.delete(line_id)
+            # 从列表中移除
+            if line_tag:
+                self.map_lines = [line for line in self.map_lines if line['tag'] != line_tag]
+            else:
+                self.map_lines = [line for line in self.map_lines if line['id'] != line_id]
+            self.log_message("线段已删除", level="info")
+
+    def start_add_camera_mode(self):
+        """开始添加相机模式"""
+        self.is_edit_mode = True
+        self.is_line_mode = False
+        self.edit_mode_label.config(text="点击地图添加新相机")
+        self.map_canvas.config(cursor="crosshair")
+        self.add_camera_btn.config(text="✖️ 取消添加", command=self.cancel_add_camera_mode)
+        self.add_line_btn.config(state="disabled")
+        
+        # 清除线段绘制状态
+        self.map_canvas.delete("temp_point")
+        self.map_canvas.delete("temp_line")
+        self.line_start = None
+
+    def cancel_add_camera_mode(self):
+        """取消添加相机模式"""
+        self.is_edit_mode = False
+        self.edit_mode_label.config(text="")
+        self.map_canvas.config(cursor="")
+        self.add_camera_btn.config(text="➕ 添加相机", command=self.start_add_camera_mode)
+        self.add_line_btn.config(state="normal")
+        
+        # 清除临时预览
+        self.map_canvas.delete("temp_camera")
+        self.map_canvas.delete("temp_point")
+        self.map_canvas.delete("temp_line")
+
+    def check_camera_selection(self, event):
+        """检查是否选中了相机（用于移动）"""
+        items = self.map_canvas.find_overlapping(event.x-5, event.y-5, event.x+5, event.y+5)
+        for item in items:
+            tags = self.map_canvas.gettags(item)
+            for tag in tags:
+                if tag.startswith("camera_"):
+                    camera_name = tag[7:]
+                    # 开始拖动相机
+                    self.start_drag_camera(camera_name, event)
+                    return
+
+    def start_drag_camera(self, camera_name, event):
+        """开始拖动相机"""
+        self.dragging_camera = camera_name
+        self.drag_start_x = event.x
+        self.drag_start_y = event.y
+        
+        # 保存被拖动相机的原始位置
+        for camera in self.camera_list:
+            if camera["name"] == camera_name:
+                self.original_position = camera["position"]
+                break
+        
+        # 改变鼠标样式
+        self.map_canvas.config(cursor="fleur")
+        
+        # 绑定拖动事件
+        self.map_canvas.bind("<B1-Motion>", self.on_drag_motion)
+        self.map_canvas.bind("<ButtonRelease-1>", self.on_drag_release)
+
+    def on_drag_motion(self, event):
+        """拖动相机时的处理 - 解决拖影问题"""
+        if hasattr(self, 'dragging_camera'):
+            x, y = event.x, event.y
+            
+            # 只更新被拖动的相机位置
+            for camera in self.camera_list:
+                if camera["name"] == self.dragging_camera:
+                    camera["position"] = (x, y)
+                    break
+            
+            # 重新绘制所有相机（会清除旧的）
+            self.draw_parallel_circuit_camera_markers()
+
+    def on_drag_release(self, event):
+        """释放拖动时的处理"""
+        if hasattr(self, 'dragging_camera'):
+            # 恢复鼠标样式
+            self.map_canvas.config(cursor="")
+            
+            # 解除拖动绑定
+            self.map_canvas.unbind("<B1-Motion>")
+            self.map_canvas.unbind("<ButtonRelease-1>")
+            delattr(self, 'dragging_camera')
+            if hasattr(self, 'original_position'):
+                delattr(self, 'original_position')
+            
+            # 确保最终位置正确
+            self.draw_parallel_circuit_camera_markers()
+
+    def add_new_camera(self, x, y):
+        """添加新相机"""
+        # 生成新相机名称
+        existing_numbers = []
+        for cam in self.camera_list:
+            name = cam["name"]
+            if name.startswith("相机"):
+                try:
+                    num = int(name[2:])
+                    existing_numbers.append(num)
+                except:
+                    pass
+        
+        # 找到最小的可用编号
+        new_num = 1
+        while new_num in existing_numbers:
+            new_num += 1
+        new_name = f"相机{new_num}"
+        
+        # 创建新相机
+        new_camera = {
+            "name": new_name,
+            "type": "network",
+            "url": f"rtsp://camera{new_num}/stream",
+            "index": None,
+            "position": (x, y)
+        }
+        
+        self.camera_list.append(new_camera)
+        self.camera_names = [cam["name"] for cam in self.camera_list]
+        self.camera_combo["values"] = self.camera_names
+        
+        # 初始化报警状态
+        self.camera_alert_status[new_name] = False
+        
+        # 重绘地图
+        self.draw_parallel_circuit_camera_markers()
+        
+        self.log_message(f"已添加新相机: {new_name}", level="info")
+
+    def delete_camera(self, camera_name):
+        """删除相机"""
+        if len(self.camera_list) <= 1:
+            messagebox.showwarning("警告", "至少保留一个相机")
+            return
+        
+        if messagebox.askyesno("确认", f"确定要删除相机 '{camera_name}' 吗？"):
+            # 从列表中移除
+            self.camera_list = [cam for cam in self.camera_list if cam["name"] != camera_name]
+            self.camera_names = [cam["name"] for cam in self.camera_list]
+            self.camera_combo["values"] = self.camera_names
+            
+            # 从报警状态中移除
+            if camera_name in self.camera_alert_status:
+                del self.camera_alert_status[camera_name]
+            
+            # 重绘地图
+            self.draw_parallel_circuit_camera_markers()
+            
+            self.log_message(f"已删除相机: {camera_name}", level="info")
+
+    def flash_compact_circuit_camera_marker(self, camera_name):
+        """让报警的相机标记闪烁（圆形版本）"""
+        if camera_name in self.camera_markers:
+            marker_id = self.camera_markers[camera_name]
+            
+            def toggle_flash(count=0):
+                if count >= 4:  # 闪烁2次后停止
+                    # 恢复到稳定状态（红色）
+                    self.map_canvas.itemconfig(marker_id, fill="#ff0000", outline="#990000")
+                    return
+                
+                if count % 2 == 0:
+                    self.map_canvas.itemconfig(marker_id, fill="#ff9900", outline="#cc6600")  # 橙色闪烁
+                else:
+                    self.map_canvas.itemconfig(marker_id, fill="#ff0000", outline="#990000")  # 红色
+                
+                self.root.after(200, lambda: toggle_flash(count + 1))
+            
+            toggle_flash()
+
+    def update_map_camera_status(self, camera_name, is_alerting):
+        """更新地图上相机的状态（纯显示，无点击功能）"""
+        # 更新报警状态
+        self.camera_alert_status[camera_name] = is_alerting
+        
+        # 重绘相机标记 - 使用并联电路版本
+        self.draw_parallel_circuit_camera_markers()
+        
+        # 添加闪烁效果
+        if is_alerting:
+            self.flash_parallel_circuit_camera_marker(camera_name)
+    
+    def flash_parallel_circuit_camera_marker(self, camera_name):
+        """让报警的相机标记闪烁"""
+        if camera_name in self.camera_markers:
+            marker_id = self.camera_markers[camera_name]
+            
+            def toggle_flash(count=0):
+                if count >= 4:  # 闪烁2次后停止
+                    self.map_canvas.itemconfig(marker_id, fill="#ff0000", outline="#990000")
+                    return
+                
+                if count % 2 == 0:
+                    self.map_canvas.itemconfig(marker_id, fill="#ff9900", outline="#cc6600")
+                else:
+                    self.map_canvas.itemconfig(marker_id, fill="#ff0000", outline="#990000")
+                
+                self.root.after(200, lambda: toggle_flash(count + 1))
+            
+            toggle_flash()
+    
+    def draw_map_background(self):
+        """绘制电子地图背景"""
+        # 绘制铁路线
+        self.map_canvas.create_line(50, 100, 500, 100, width=3, fill="#666666", dash=(5, 3))
+        self.map_canvas.create_line(100, 200, 450, 200, width=3, fill="#666666", dash=(5, 3))
+        
+        # 绘制站台
+        self.map_canvas.create_rectangle(80, 70, 200, 130, fill="#e0e0e0", outline="#999999")
+        self.map_canvas.create_text(140, 100, text="1号站台", font=("Microsoft YaHei", 8))
+        
+        self.map_canvas.create_rectangle(250, 120, 370, 180, fill="#e0e0e0", outline="#999999")
+        self.map_canvas.create_text(310, 150, text="2号站台", font=("Microsoft YaHei", 8))
+        
+        self.map_canvas.create_rectangle(400, 170, 520, 230, fill="#e0e0e0", outline="#999999")
+        self.map_canvas.create_text(460, 200, text="3号站台", font=("Microsoft YaHei", 8))
+        
+        # 绘制建筑物
+        self.map_canvas.create_rectangle(50, 250, 150, 320, fill="#cccccc", outline="#999999")
+        self.map_canvas.create_text(100, 285, text="候车厅", font=("Microsoft YaHei", 8))
+        
+        self.map_canvas.create_rectangle(350, 280, 450, 350, fill="#cccccc", outline="#999999")
+        self.map_canvas.create_text(400, 315, text="调度中心", font=("Microsoft YaHei", 8))
+        
+        # 绘制道路
+        self.map_canvas.create_line(200, 350, 300, 350, width=2, fill="#aaaaaa")
+        self.map_canvas.create_line(250, 350, 250, 250, width=2, fill="#aaaaaa")
+        
+        # 绘制标题
+        self.map_canvas.create_text(275, 20, text="北京北站 电子地图", 
+                                    font=("Microsoft YaHei", 12, "bold"))
+
+    def draw_camera_markers(self):
+        """绘制相机标记"""
+        # 清除现有标记
+        for marker_id in self.camera_markers.values():
+            self.map_canvas.delete(marker_id)
+        self.camera_markers.clear()
+        
+        # 为每个相机绘制标记
+        for camera in self.camera_list:
+            name = camera["name"]
+            x, y = camera["position"]
+            
+            # 检查报警状态
+            is_alert = self.camera_alert_status.get(name, False)
+            is_selected = (self.camera_var.get() == name)
+            
+            # 根据状态选择颜色
+            if is_alert:
+                color = "red"
+                outline = "darkred"
+            elif is_selected:
+                color = "yellow"
+                outline = "orange"
+            else:
+                color = "green"
+                outline = "darkgreen"
+            
+            # 绘制相机标记（使用圆形表示相机）
+            marker_id = self.map_canvas.create_oval(
+                x-12, y-12, x+12, y+12,
+                fill=color, outline=outline, width=2,
+                tags=("camera_marker", f"camera_{name}")
+            )
+            
+            # 添加相机图标（摄像头符号）
+            self.map_canvas.create_text(x, y-2, text="📷", font=("Microsoft YaHei", 10),
+                                        tags=("camera_icon", f"icon_{name}"))
+            
+            # 添加相机名称
+            self.map_canvas.create_text(x, y+20, text=name[:6], font=("Microsoft YaHei", 7),
+                                        tags=("camera_label", f"label_{name}"))
+            
+            # 存储标记ID
+            self.camera_markers[name] = marker_id
+
+
+    def flash_camera_marker(self, camera_name):
+        """让报警的相机标记闪烁"""
+        if camera_name in self.camera_markers:
+            marker_id = self.camera_markers[camera_name]
+            
+            def toggle_flash(count=0):
+                if count >= 6:  # 闪烁3次后停止
+                    self.draw_camera_markers()  # 恢复到稳定状态
+                    return
+                
+                if count % 2 == 0:
+                    self.map_canvas.itemconfig(marker_id, fill="orange", outline="red")
+                else:
+                    self.map_canvas.itemconfig(marker_id, fill="red", outline="darkred")
+                
+                self.root.after(200, lambda: toggle_flash(count + 1))
+            
+            toggle_flash()
+
+    def demo_map_alert(self):
+        """演示模式：让相机2变红"""
+        if self.camera_list:
+            # 设置相机2为报警状态
+            self.update_map_camera_status("相机2 (网络)", True)
+            
+            # 显示演示提示
+            self.status_var.set("演示模式：相机2触发报警")
+            self.log_message("演示模式：相机2在地图上显示为红色", level="warning")
     
     def create_detection_tab(self, notebook):
         """创建检测参数选项卡"""
@@ -1330,8 +2020,8 @@ class AirborneDetectionGUI:
             
             later_btn = ttk.Button(
                 options_frame,
-                text="⏱️ 稍后处理",
-                command=mark_as_read_later,
+                text="查看事件详情",
+                command=lambda: self.show_event_details(event_id, dialog),
                 width=20
             )
             later_btn.grid(row=1, column=0, columnspan=2, pady=(10, 0))
@@ -1359,7 +2049,7 @@ class AirborneDetectionGUI:
             options_frame.columnconfigure(1, weight=1)
             
             # 绑定窗口关闭事件
-            dialog.protocol("WM_DELETE_WINDOW", lambda: self.close_alert_window(event_id))
+            dialog.protocol("WM_DELETE_WINDOW", lambda: None)
             
             print(f"DEBUG: 对话框创建完成")
             
@@ -2116,57 +2806,145 @@ class AirborneDetectionGUI:
         self.quality_detail_var.set(detail_text)
 
     def save_and_display_screenshot(self, frame, detection):
-        """保存并显示空飘物截图 - 按相机分类，支持事件管理"""
+        """保存并显示空飘物截图 - 使用事件ID索引确保正确更新"""
         try:
-            # 1. 检查是否满足事件条件
             current_time = time.time()
-            if self.last_event_time and (current_time - self.last_event_time) < self.event_interval:
-                # 在同一个事件间隔内，属于同一个事件
-                event_id = self.current_event_id
-            else:
-                # 新事件
-                self.current_event_id += 1
-                event_id = self.current_event_id
-                self.last_event_time = current_time
-                
-                # 记录事件信息
-                event_info = {
-                    'event_id': event_id,
-                    'camera': self.current_camera_name,
-                    'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'detection_count': 1,
-                    'screenshot_count': 0
-                }
-                self.events.append(event_info)
-                
-                # 弹窗预警  <-- 先触发报警！
-                if self.alert_enabled:
-                    self.show_alert_dialog(event_id, self.current_camera_name)
-            
-            # 2. 更新当前事件信息
-            for event in self.events:
-                if event['event_id'] == event_id:
-                    event['detection_count'] += 1
-                    break
-            
-            # 3. 检查该事件已有多少张截图
-            existing_screenshots = [s for s in self.screenshots if s['event_id'] == event_id]
-            
-            # 如果已经有3张或更多截图，直接返回不保存（但报警已触发）
-            if len(existing_screenshots) >= 3:
-                # 但仍然更新事件检测次数
-                for event in self.events:
-                    if event['event_id'] == event_id:
-                        # 更新检测次数但不增加截图数量
-                        # 注意：这里只更新detection_count，不更新screenshot_count
-                        pass
-                return  # 返回，但不影响已经触发的报警
-            
-            # 4. 按相机和事件创建目录结构
             camera_name = self.current_camera_name
+            
             if not camera_name:
                 camera_name = "Unknown_Camera"
             
+            # 提取ROI
+            x, y, w, h = detection['bbox']
+            margin = 20
+            x1 = max(0, x - margin)
+            y1 = max(0, y - margin)
+            x2 = min(frame.shape[1], x + w + margin)
+            y2 = min(frame.shape[0], y + h + margin)
+            
+            roi = frame[y1:y2, x1:x2]
+            
+            if roi.size == 0:
+                return
+            
+            # 提取特征
+            current_features = self._extract_image_features(roi)
+            
+            # ========== 创建事件ID到事件对象的映射 ==========
+            event_id_map = {}
+            for event in self.events:
+                eid = event.get('event_id')
+                if eid is not None:
+                    event_id_map[eid] = event
+            
+            # 搜索相似事件
+            event_id = None
+            matched_event = None
+            highest_similarity = 0
+            
+            for event in self.events:
+                # 检查条件
+                if event.get('camera') != camera_name:
+                    continue
+                
+                last_time = event.get('last_detection_time', 0)
+                if last_time <= 0:
+                    continue
+                
+                time_diff = current_time - last_time   # 只与最近的两分钟事件进行相似度判断
+                if time_diff > self.recent_time_threshold:
+                    continue
+                
+                event_features = event.get('latest_features')
+                if event_features is None:
+                    continue
+                
+                # 计算相似度
+                similarity = self._calculate_image_similarity(current_features, event_features)
+                
+                if similarity >= self.similarity_threshold and similarity > highest_similarity:
+                    highest_similarity = similarity
+                    event_id = event.get('event_id')
+                    matched_event = event
+            
+            # 判断是否为新事件
+            is_new_event = (event_id is None or highest_similarity < self.similarity_threshold)
+            
+            # 处理事件
+            if is_new_event:
+                # 创建新事件
+                self.current_event_id += 1
+                event_id = self.current_event_id
+                
+                new_event = {
+                    'event_id': event_id,
+                    'camera': camera_name,
+                    'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'detection_count': 1,
+                    'screenshot_count': 0,
+                    'last_detection_time': current_time,
+                    'latest_features': current_features,
+                    'has_alerted': False,
+                    'similarity_score': 1.0,
+                    'created_time': current_time
+                }
+                
+                self.events.append(new_event)
+                event_id_map[event_id] = new_event
+                
+                # 报警
+                if self.alert_enabled:
+                    self.show_alert_dialog(event_id, camera_name)
+                    new_event['has_alerted'] = True
+                    
+                    # ========== 修改：改为相机1触发报警 ==========
+                    if camera_name == "相机1":
+                        self.update_map_camera_status(camera_name, True)
+                        self.log_message(f"相机1触发报警，地图变红", level="info")
+                    # ========== 修改结束 ==========
+                
+                print(f"🆕 新事件 {event_id}，总事件数: {len(self.events)}")
+                
+            else:
+                # 更新现有事件 - 通过映射确保更新正确的事件
+                if matched_event and event_id in event_id_map:
+                    target_event = event_id_map[event_id]
+                    
+                    # 记录旧值用于日志
+                    old_time = target_event.get('last_detection_time', 0)
+                    old_count = target_event.get('detection_count', 0)
+                    
+                    # 更新
+                    target_event['detection_count'] = old_count + 1
+                    target_event['last_detection_time'] = old_time
+                    target_event['latest_features'] = current_features
+                    target_event['similarity_score'] = highest_similarity
+                    
+                    # 报警（如果需要）
+                    if not target_event.get('has_alerted', False):
+                        if self.alert_enabled:
+                            self.show_alert_dialog(event_id, camera_name)
+                        target_event['has_alerted'] = True
+                        
+                        # ========== 修改：改为相机1触发报警 ==========
+                        if camera_name == "相机1":
+                            self.update_map_camera_status(camera_name, True)
+                            self.log_message(f"相机1触发报警，地图变红", level="info")
+                        # ========== 修改结束 ==========
+                    
+                    print(f"🔄 更新事件 {event_id}，时间差: {current_time - old_time:.1f}秒")
+                else:
+                    print(f"⚠️ 错误：找不到事件 {event_id} 进行更新")
+            
+            # ========== 截图保存功能 ==========
+            # 检查该事件已有多少张截图
+            existing_screenshots = [s for s in self.screenshots if s['event_id'] == event_id]
+            
+            # 如果已经有3张或更多截图，直接返回不保存
+            if len(existing_screenshots) >= 3:
+                return
+            
+            # 按相机和事件创建目录结构
             import re
             camera_dir_name = re.sub(r'[<>:"/\\|?*]', '_', camera_name)
             
@@ -2177,32 +2955,15 @@ class AirborneDetectionGUI:
             if not os.path.exists(event_dir):
                 os.makedirs(event_dir, exist_ok=True)
             
-            # 5. 保存截图
+            # 保存截图
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
             filename = f"{event_id:03d}_{detection['id']}_{len(existing_screenshots)+1}_{timestamp}.jpg"
             filepath = os.path.join(event_dir, filename)
             
-            # 从检测框中提取目标区域
-            x, y, w, h = detection['bbox']
-            
-            # 扩展边界（增加一些上下文）
-            margin = 20
-            x1 = max(0, x - margin)
-            y1 = max(0, y - margin)
-            x2 = min(frame.shape[1], x + w + margin)
-            y2 = min(frame.shape[0], y + h + margin)
-            
-            # 截取区域
-            roi = frame[y1:y2, x1:x2]
-            
-            if roi.size == 0:
-                return
-            
-            # 保存截图
             cv2.imwrite(filepath, roi)
             
-            # 创建缩略图（固定大小）
-            thumbnail_size = (120, 90)  # 宽高比4:3
+            # 创建缩略图
+            thumbnail_size = (120, 90)
             thumbnail = cv2.resize(roi, thumbnail_size)
             thumbnail = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB)
             
@@ -2224,22 +2985,228 @@ class AirborneDetectionGUI:
             
             self.screenshots.append(screenshot_info)
             
-            # 6. 更新事件截图数量
+            # 更新事件截图数量
             for event in self.events:
                 if event['event_id'] == event_id:
                     event['screenshot_count'] = len(existing_screenshots) + 1
                     break
             
-            # 7. 更新截图显示
+            # 更新截图显示
             self.update_screenshot_tree()
             
-            # 8. 更新统计
+            # 更新统计
             self.update_screenshot_statistics()
-            
-            self.log_message(f"事件 {event_id} - 检测 {detection['id']} 截图已保存")
             
         except Exception as e:
             self.log_message(f"保存截图失败: {str(e)}", level="error")
+    
+    def debug_event_timestamps(self):
+        """调试事件时间戳"""
+        current_time = time.time()
+        print(f"\n=== 事件时间戳调试 ===")
+        print(f"当前时间: {current_time}")
+        
+        if not self.events:
+            print("没有事件记录")
+            return
+        
+        for i, event in enumerate(self.events):
+            event_id = event.get('event_id', '未知')
+            last_time = event.get('last_detection_time', 0)
+            created_time = event.get('created_time', 0)
+            camera = event.get('camera', '未知')
+            
+            time_diff_last = current_time - last_time if last_time > 0 else float('inf')
+            time_diff_created = current_time - created_time if created_time > 0 else float('inf')
+            
+            print(f"事件[{i}] ID:{event_id} 相机:{camera}")
+            print(f"  最后检测时间: {last_time} ({time_diff_last:.1f}秒前)")
+            print(f"  创建时间: {created_time} ({time_diff_created:.1f}秒前)")
+            print(f"  检测次数: {event.get('detection_count', 0)}")
+            print(f"  有特征: {'latest_features' in event}")
+            print(f"  已报警: {event.get('has_alerted', False)}")
+            print("-" * 40)
+    
+    # 可以在GUI中添加一个调试按钮
+    def add_debug_button(self):
+        """添加调试按钮"""
+        debug_frame = ttk.Frame(self.root)
+        debug_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        ttk.Button(
+            debug_frame,
+            text="调试事件时间戳",
+            command=self.debug_event_timestamps
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            debug_frame,
+            text="测试相似度",
+            command=self.test_similarity
+        ).pack(side=tk.LEFT, padx=5)
+
+    def test_similarity(self):
+        """测试相似度计算"""
+        if len(self.events) < 2:
+            print("需要至少2个事件来测试相似度")
+            return
+        
+        event1 = self.events[-1]  # 最新事件
+        event2 = self.events[-2]  # 次新事件
+        
+        if 'latest_features' in event1 and 'latest_features' in event2:
+            similarity = self._calculate_image_similarity(
+                event1['latest_features'], 
+                event2['latest_features']
+            )
+            print(f"事件 {event1['event_id']} 和事件 {event2['event_id']} 的相似度: {similarity:.2f}")
+        else:
+            print("事件缺少特征数据")
+
+    def _extract_image_features(self, image):
+        """提取图像特征 - 改进版"""
+        try:
+            if image is None or image.size == 0:
+                return None
+            
+            features = {}
+            
+            # 1. 颜色直方图（BGR）
+            if len(image.shape) == 3:
+                color_features = []
+                for i in range(3):  # BGR通道
+                    hist = cv2.calcHist([image], [i], None, [16], [0, 256])
+                    hist = cv2.normalize(hist, hist).flatten()
+                    color_features.extend(hist)
+                features['color'] = np.array(color_features)
+            
+            # 2. 转换为HSV空间提取特征
+            if len(image.shape) == 3:
+                hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+                h_hist = cv2.calcHist([hsv], [0], None, [12], [0, 180])
+                s_hist = cv2.calcHist([hsv], [1], None, [8], [0, 256])
+                v_hist = cv2.calcHist([hsv], [2], None, [8], [0, 256])
+                
+                h_hist = cv2.normalize(h_hist, h_hist).flatten()
+                s_hist = cv2.normalize(s_hist, s_hist).flatten()
+                v_hist = cv2.normalize(v_hist, v_hist).flatten()
+                
+                features['hsv'] = np.hstack([h_hist, s_hist, v_hist])
+            
+            # 3. 灰度图像纹理特征
+            if len(image.shape) == 3:
+                gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            else:
+                gray = image
+                
+            # 计算梯度直方图
+            grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            magnitude = np.sqrt(grad_x**2 + grad_y**2)
+            
+            # 归一化并计算直方图
+            if magnitude.max() > 0:
+                magnitude = (magnitude / magnitude.max() * 255).astype(np.uint8)
+                hist = cv2.calcHist([magnitude], [0], None, [8], [0, 256])
+                hist = cv2.normalize(hist, hist).flatten()
+                features['texture'] = hist
+            else:
+                features['texture'] = np.zeros(8)
+            
+            return features
+            
+        except Exception as e:
+            print(f"特征提取失败: {e}")
+            return None
+
+    def _calculate_image_similarity(self, features1, features2):
+        """计算图像相似度 - 加权综合"""
+        try:
+            if features1 is None or features2 is None:
+                return 0.0
+            
+            total_similarity = 0.0
+            total_weight = 0.0
+            
+            # 特征权重
+            weights = {
+                'color': 0.4,
+                'hsv': 0.3,
+                'texture': 0.3
+            }
+            
+            for feature_type in weights.keys():
+                if feature_type in features1 and feature_type in features2:
+                    f1 = features1[feature_type]
+                    f2 = features2[feature_type]
+                    
+                    # 确保长度一致
+                    min_len = min(len(f1), len(f2))
+                    if min_len == 0:
+                        continue
+                        
+                    f1 = f1[:min_len]
+                    f2 = f2[:min_len]
+                    
+                    # 计算余弦相似度
+                    dot_product = np.dot(f1, f2)
+                    norm1 = np.linalg.norm(f1)
+                    norm2 = np.linalg.norm(f2)
+                    
+                    if norm1 > 0 and norm2 > 0:
+                        similarity = dot_product / (norm1 * norm2)
+                        similarity = max(0.0, min(1.0, similarity))
+                        
+                        total_similarity += similarity * weights[feature_type]
+                        total_weight += weights[feature_type]
+            
+            # 计算加权平均
+            if total_weight > 0:
+                return total_similarity / total_weight
+            else:
+                return 0.0
+                
+        except Exception as e:
+            print(f"相似度计算失败: {e}")
+            return 0.0
+    
+    def debug_similarity(self, image1, image2):
+        """调试相似度计算"""
+        features1 = self._extract_image_features(image1)
+        features2 = self._extract_image_features(image2)
+        similarity = self._calculate_image_similarity(features1, features2)
+        
+        print(f"相似度: {similarity:.3f}")
+        return similarity
+
+    def debug_event_comparison(self):
+        """调试事件比较逻辑"""
+        current_time = time.time()
+        print(f"\n=== 事件比较调试 ===")
+        print(f"当前时间: {current_time}")
+        print(f"总事件数: {len(self.events)}")
+        
+        recent_events = []
+        old_events = []
+        
+        for event in self.events:
+            event_time = event.get('last_detection_time', 0)
+            time_diff = current_time - event_time
+            
+            if time_diff <= 120:
+                recent_events.append(event)
+            else:
+                old_events.append(event)
+        
+        print(f"最近2分钟内事件: {len(recent_events)}个")
+        print(f"超过2分钟事件: {len(old_events)}个")
+        
+        for event in recent_events[:5]:  # 显示前5个最近事件
+            event_time = event.get('last_detection_time', 0)
+            time_diff = current_time - event_time
+            print(f"  事件 {event['event_id']}: {time_diff:.1f}秒前")
+        
+        return recent_events, old_events
     
     def display_screenshot_by_camera(self):
         """按相机分类显示截图"""
@@ -2626,10 +3593,12 @@ class AirborneDetectionGUI:
         """刷新截图显示 - 改为更新树形结构"""
         self.update_screenshot_tree()
     
-    # ========== 修复 show_alert_dialog 方法，确保只弹出一个窗口 ==========
     def show_alert_dialog(self, event_id, camera_name):
-        """显示预警弹窗 - 确保只弹出一个窗口"""
+        """显示预警弹窗 - 叠加显示多个窗口"""
         try:
+            # 更新电子地图状态（变红）
+            self.update_map_camera_status(camera_name, True)
+            
             # 1. 检查是否已有相同事件的预警窗口打开
             if event_id in self.alert_windows:
                 window = self.alert_windows[event_id]
@@ -2638,21 +3607,14 @@ class AirborneDetectionGUI:
                     window.focus_set()  # 设置焦点
                     return
             
-            # 2. 检查是否已达到最大窗口数量
-            if len(self.alert_windows) >= self.max_concurrent_alerts:
-                # 将警报加入队列
-                self.alert_queue.append((event_id, camera_name))
-                self.log_message(f"警报 {event_id} 已加入队列，当前队列长度: {len(self.alert_queue)}")
-                return
-            
-            # 3. 创建预警窗口
+            # 2. 创建预警窗口（不再限制数量）
             self._create_alert_window(event_id, camera_name)
             
         except Exception as e:
             self.log_message(f"显示预警弹窗失败: {str(e)}", level="error")
 
     def _create_alert_window(self, event_id, camera_name):
-        """创建单个预警窗口"""
+        """创建单个预警窗口 - 在屏幕中心显示，多个窗口向固定右下方向偏移"""
         try:
             # 创建预警窗口
             alert_window = tk.Toplevel(self.root)
@@ -2660,21 +3622,40 @@ class AirborneDetectionGUI:
             alert_window.geometry("400x400")
             alert_window.resizable(False, False)
             
-            # 设置置顶和模态
-            alert_window.attributes('-topmost', True)
+            # 设置模态
             alert_window.transient(self.root)
-            alert_window.grab_set()
             
             # 保存窗口引用
             self.alert_windows[event_id] = alert_window
             
-            # 居中显示
-            alert_window.update_idletasks()
-            width = alert_window.winfo_width()
-            height = alert_window.winfo_height()
-            x = self.root.winfo_x() + (self.root.winfo_width() - width) // 2
-            y = self.root.winfo_y() + (self.root.winfo_height() - height) // 2
-            alert_window.geometry(f"{width}x{height}+{x}+{y}")
+            # 计算已打开的窗口数量（用于叠加偏移）
+            window_index = len(self.alert_windows) - 1
+            
+            # 计算屏幕尺寸
+            screen_width = alert_window.winfo_screenwidth()
+            screen_height = alert_window.winfo_screenheight()
+            
+            window_width = 400
+            window_height = 400
+            
+            # 基础位置（稍微偏离中心，给偏移留空间）
+            base_x = screen_width // 2 - window_width // 2 - 50
+            base_y = screen_height // 2 - window_height // 2 - 50
+            
+            # 固定向右下方向偏移（每个窗口偏移25像素）
+            offset_x = window_index * 25
+            offset_y = window_index * 25
+            
+            # 最终位置
+            x = base_x + offset_x
+            y = base_y + offset_y
+            
+            # 确保窗口在屏幕内
+            x = max(0, min(x, screen_width - window_width))
+            y = max(0, min(y, screen_height - window_height))
+            
+            # 设置窗口位置
+            alert_window.geometry(f"{window_width}x{window_height}+{int(x)}+{int(y)}")
             
             # 主框架
             main_frame = ttk.Frame(alert_window, padding="20")
@@ -2723,7 +3704,7 @@ class AirborneDetectionGUI:
                     font=("Microsoft YaHei", 10)
                 ).grid(row=i, column=0, sticky=tk.W, pady=2)
             
-            # 信息提示（移除选择按钮）
+            # 信息提示
             alert_info_frame = ttk.LabelFrame(main_frame, text="警报信息", padding="10")
             alert_info_frame.grid(row=2, column=0, columnspan=2, pady=(10, 15), sticky=(tk.W, tk.E))
             
@@ -2761,7 +3742,7 @@ class AirborneDetectionGUI:
             main_frame.columnconfigure(1, weight=1)
             
             # 绑定窗口关闭事件
-            alert_window.protocol("WM_DELETE_WINDOW", lambda: self.close_alert_window(event_id))
+            alert_window.protocol("WM_DELETE_WINDOW", lambda: None)
             
             # 播放提示音
             self.play_alert_sound()
@@ -2776,11 +3757,19 @@ class AirborneDetectionGUI:
             self.log_message(f"创建预警窗口失败: {str(e)}", level="error")
         
     def close_alert_window(self, event_id, mark_read=True):
-        """关闭预警窗口并处理队列中的下一个警报"""
+        """关闭预警窗口"""
         try:
             # 1. 关闭当前窗口
             if event_id in self.alert_windows:
                 window = self.alert_windows[event_id]
+                camera_name = None
+                
+                # 获取该事件对应的相机名称
+                for cam, alerts in self.unread_alerts.items():
+                    if event_id in alerts:
+                        camera_name = cam
+                        break
+                
                 if window and window.winfo_exists():
                     if mark_read:
                         self.mark_alert_as_read(event_id)
@@ -2788,13 +3777,25 @@ class AirborneDetectionGUI:
                 
                 # 从窗口字典中移除
                 del self.alert_windows[event_id]
+                
+                # ========== 修改：改为相机1 ==========
+                if camera_name == "相机1":
+                    has_other_alerts = False
+                    for cam, alerts in self.unread_alerts.items():
+                        if cam == camera_name and alerts:
+                            has_other_alerts = True
+                            break
+                    
+                    if not has_other_alerts:
+                        self.update_map_camera_status(camera_name, False)
+                        self.log_message(f"相机1所有警报已处理，地图状态恢复为灰色", level="info")
+                # ========== 修改结束 ==========
             
-            # 2. 如果有等待的警报，显示下一个
-            if self.alert_queue:
-                next_event_id, next_camera_name = self.alert_queue.pop(0)
-                self.log_message(f"显示队列中的下一个警报: {next_event_id}")
-                self._create_alert_window(next_event_id, next_camera_name)
-        
+            # 2. 重新排列剩余窗口的位置（可选）
+            if not self.alert_windows:
+                for camera_name in self.camera_alert_status:
+                    self.camera_alert_status[camera_name] = False
+                
         except Exception as e:
             self.log_message(f"关闭警报窗口失败: {str(e)}", level="error")
 
@@ -2916,6 +3917,20 @@ class AirborneDetectionGUI:
             # 从窗口管理器中移除
             if event_id in self.alert_windows:
                 del self.alert_windows[event_id]
+            
+            # ========== 修改：检查相机1是否还有未处理的警报 ==========
+            # 检查该相机是否还有其他未处理的警报
+            has_other_alerts = False
+            for cam, alerts in self.unread_alerts.items():
+                if cam == camera_name and alerts:
+                    has_other_alerts = True
+                    break
+            
+            # 如果是相机1且没有其他未处理警报，恢复为灰色
+            if camera_name == "相机1" and not has_other_alerts:
+                self.update_map_camera_status(camera_name, False)
+                self.log_message(f"相机1所有警报已处理，地图状态恢复为灰色", level="info")
+            # ========== 修改结束 ==========
             
         except Exception as e:
             print(f"DEBUG: 处理警报类型失败: {str(e)}")
@@ -3554,7 +4569,7 @@ class AirborneDetectionGUI:
             
         except Exception as e:
             messagebox.showerror("错误", f"启动摄像头失败: {str(e)}")
-    
+
     def show_custom_camera_dialog(self):
         """显示自定义摄像头配置对话框"""
         dialog = tk.Toplevel(self.root)
@@ -3880,8 +4895,34 @@ class AirborneDetectionGUI:
                 messagebox.showerror("错误", f"无法打开视频文件: {file_path}")
                 return
             
-            # 设置摄像头名称为文件名
-            self.current_camera_name = os.path.basename(file_path)
+            # ========== 修改：使用"相机1"作为报警相机 ==========
+            # 检查相机1是否存在，如果不存在则创建
+            camera1_exists = False
+            for cam in self.camera_list:
+                if cam["name"] == "相机1":
+                    camera1_exists = True
+                    break
+            
+            if not camera1_exists:
+                # 创建相机1
+                self.camera_list.append({
+                    "name": "相机1",
+                    "type": "network",
+                    "url": "rtsp://admin:admin123@192.168.1.101:554/Streaming/Channels/1",
+                    "index": None,
+                    "position": (150, 80)
+                })
+                self.camera_names = [cam["name"] for cam in self.camera_list]
+                self.camera_combo["values"] = self.camera_names
+                
+                # 初始化报警状态
+                self.camera_alert_status["相机1"] = False
+                
+                # 重绘地图
+                self.draw_parallel_circuit_camera_markers()
+            
+            self.current_camera_name = "相机1"  # 使用相机1
+            # ========== 修改结束 ==========
             
             # 获取视频信息
             fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -3896,6 +4937,7 @@ class AirborneDetectionGUI:
             self.status_var.set("视频文件已加载")
             self.log_message(f"视频文件已加载: {file_path}")
             self.log_message(f"视频信息: {fps:.1f} FPS, {frame_count}帧, {duration:.1f}秒")
+            self.log_message("当前使用相机1进行检测，报警时将在地图上显示为红色")
             
             # 开始处理帧
             self.process_frame()
@@ -4811,7 +5853,7 @@ class AirborneDetectionGUI:
                 messagebox.showwarning("警告", "至少需要3个点才能形成区域")
                 return
             
-            # 保存选择的区域
+            # 保存选择的区域(点)
             self.selected_region = self.region_points.copy()
             
             # 关闭编辑器窗口
@@ -5047,6 +6089,7 @@ class AirborneDetectionGUI:
                     return
             
             # ========== 新增：绘制检测区域（如果已设置） ==========
+            start_time = time.time()
             if self.selected_region and len(self.selected_region) >= 3:
                 try:
                     # 将点列表转换为numpy数组
@@ -5073,9 +6116,12 @@ class AirborneDetectionGUI:
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
                 except Exception as e:
                     print(f"绘制检测区域时出错: {e}")
+            end_time = time.time()
+            #print(f"绘制区域花费时间： {end_time - start_time} s")
             # ========== 新增结束 ==========
             
-            # 获取质量信息
+            # 获取质量信息 
+            quality_time1 = time.time()
             quality_info = self.detector.get_quality_info()
             is_night = quality_info.get('is_night', False)
             
@@ -5157,7 +6203,10 @@ class AirborneDetectionGUI:
                                  font_size=30, 
                                  color=(0, 0, 255),
                                  bg_color=(255, 255, 255))  # 白色背景
-            
+            quality_time2 = time.time()
+            # print(f"计算图片质量花费: {quality_time2 - quality_time1} s")
+
+            relax_time1 = time.time()
             # 显示帧
             self.display_frame(result_frame, self.video_label)
             
@@ -5175,6 +6224,8 @@ class AirborneDetectionGUI:
             # 继续处理下一帧
             if self.is_running:
                 self.update_job = self.root.after(30, self.process_frame)
+            relax_time2 = time.time()
+            #print(f"剩余耗时: {relax_time2 - relax_time1} s")
             
         except Exception as e:
             self.log_message(f"处理帧时出错: {str(e)}", level="error")

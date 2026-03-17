@@ -422,13 +422,13 @@ class AirborneDetector:
                         'contour': contour,
                         'timestamp': time.time()
                     })
-        
         return regions
     
     def update_tracks(self, regions, frame_timestamp):
         """更新轨迹跟踪"""
         # 只处理在ROI内的区域
         filtered_regions = []
+        # TODO:应该将区域中心、颜色相近的区域合并为同一个
         for region in regions:
             # 检查区域中心是否在ROI内
             if self.roi_mask is not None and self.enable_roi:
@@ -683,7 +683,7 @@ class AirborneDetector:
         R = np.sqrt(sin_sum**2 + cos_sum**2) / len(angles)
         return 1 - R
     
-    def fixed_size_motion_mask(self, motion_mask, max_growth_ratio=1.5):
+    def fixed_size_motion_mask(self, motion_mask, max_growth_ratio=2.5):
         """限制运动掩码的最大尺寸"""
         if motion_mask is None or self.last_motion_mask is None:
             return motion_mask
