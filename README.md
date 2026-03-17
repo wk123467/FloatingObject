@@ -112,4 +112,8 @@
 <div align=center>
 <img src="https://github.com/wk123467/FloatingObject/blob/main/img/img10.png" width="100%">
 </div>
+- 电子地图功能，能简略将相机位置在地图中显示
 
+<div align=center>
+<img src="https://github.com/wk123467/FloatingObject/blob/main/img/img11.png" width="100%">
+</div>
